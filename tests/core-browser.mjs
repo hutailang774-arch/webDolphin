@@ -1,0 +1,487 @@
+import { createLobbyHandler } from '../tools/lan-lobbies.mjs';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { readFile, writeFile, readdir, mkdtemp, rm } from 'node:fs/promises';
+import { resolve, join, extname, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import puppeteer from 'puppeteer-core';
+import { makeHomebrewDisc } from './helpers/homebrew-disc.mjs';
+const root = resolve('web');
+const lobbyHandler = createLobbyHandler();
+const server = createServer(async (request,response) => {
+  if (await lobbyHandler(request, response)) return;
+  try {
+    const path = decodeURIComponent(new URL(request.url,'http://localhost').pathname);
+    const file = resolve(root, path.slice(1) || 'index.html');
+    if (!file.startsWith(root + sep)) { response.writeHead(403).end(); return; }
+    const body = await readFile(file);
+    response.writeHead(200,{'content-type':({'.html':'text/html','.js':'text/javascript','.json':'application/json','.css':'text/css','.wasm':'application/wasm'})[extname(file)] || 'application/octet-stream',
+      'cross-origin-opener-policy':'same-origin','cross-origin-embedder-policy':'require-corp'});
+    response.end(body);
+  } catch { response.writeHead(404).end(); }
+});
+await new Promise(done=>server.listen(0,'127.0.0.1',done));
+const temp = await mkdtemp(join(tmpdir(),'dolphin-core-'));
+let browser;
+try {
+  const file = join(temp,'Dolphin CPU homebrew.iso'); await writeFile(file,makeHomebrewDisc());
+  const invalidState = join(temp,'invalid.sav'); await writeFile(invalidState, new Uint8Array(8));
+  browser = await puppeteer.launch({executablePath:process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true,args:['--enable-unsafe-webgpu', ...(process.env.CI ? ['--no-sandbox'] : [])]});
+  const page = await browser.newPage(); const errors=[];
+  // Native-input coverage uses a fixed catalog: a live refresh can replace
+  // the cached Play button and change the widget height during a click.
+  await page.evaluateOnNewDocument(() => {
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => String(input?.url || input) === 'https://archive.org/metadata/Wii_ISO'
+      ? Promise.resolve(new Response(JSON.stringify({files:[{name:'Dolphin CPU homebrew.iso',size:16*1024*1024}]}),
+          {headers:{'content-type':'application/json'}}))
+      : originalFetch(input, init);
+  });
+  page.on('pageerror',error=>{errors.push(error.message);console.log('PAGE ERROR',error.message)});
+  page.on('console',message=>{if(message.type()==='error') console.log('CONSOLE',message.text())});
+  const testUrl = new URL(process.env.DOLPHIN_URL || `http://127.0.0.1:${server.address().port}/`);
+  testUrl.searchParams.set('video', 'software');
+  testUrl.searchParams.set('presenter', '2d');
+  testUrl.searchParams.set('cpu', 'dual');
+  await page.goto(testUrl.href);
+  // Pages reloads once when its isolation worker takes control. Do not import
+  // a disc into the initial document while that reload is still pending.
+  await page.waitForFunction(()=>crossOriginIsolated && window.__host && document.querySelector('#romInput'),{timeout:60000});
+  await page.waitForFunction(()=>document.querySelector('.library-section')?.dataset.ready === 'true',{timeout:60000});
+  await (await page.$('#libraryFiles')).uploadFile(file);
+  await page.waitForFunction(()=>document.querySelector('.library-section')?.dataset.catalogLoaded === 'true' && document.querySelector('#libraryReadyList button')?.disabled === false,{timeout:60000});
+  await page.evaluate(()=>localStorage.setItem('dolphin-nunchuk-connected', 'false'));
+  // Revisit to prove that Play boots a persisted image rather than the import.
+  // A normal navigation also runs through the Pages isolation worker.
+  await page.goto(testUrl.href);
+  await page.waitForFunction(()=>document.querySelector('.library-section')?.dataset.catalogLoaded === 'true' && document.querySelector('#libraryReadyList button')?.disabled === false,{timeout:60000});
+  await page.locator('#libraryReadyList button').click(); // Re-queries if the list re-renders.
+  await page.waitForFunction(()=>window.__host?.game?.coreBoot?.accepted,{timeout:60000}).catch(async error=>{
+    console.log('Cached Play boot failure',await page.evaluate(()=>({game:window.__host?.game,mode:window.__host?.mode,libraryStatus:document.querySelector('#libraryStatus')?.textContent,status:document.querySelector('#hudStatus')?.textContent,buttons:[...document.querySelectorAll('#libraryReadyList button')].map(b=>({text:b.textContent,disabled:b.disabled}))})));
+    throw error;
+  });
+  // The generated guest draws nothing, so the loading bar stays in its boot
+  // stage instead of finishing on a first visible frame.
+  const loading=await page.$eval('.boot-progress',el=>({hidden:el.hidden,stage:el.querySelector('.boot-progress-stage').textContent}));
+  assert.deepEqual(loading,{hidden:false,stage:'Booting game'},'cached Play must show the loading bar until a game frame is visible');
+  await page.waitForFunction(()=>document.activeElement?.id === 'screen',{timeout:10000});
+  console.log('Boot accepted');
+  const first = await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  console.log('First progress',first);
+  await page.waitForFunction(async()=>{
+    const progress=await window.__host.adapter.request('validationReadCoreProgress');
+    const pc = progress.ppcPc >>> 0;
+    return pc >= 0x8000310c && pc <= 0x80003114 && progress.coreTicks > 0;
+  },{timeout:60000,polling:200});
+  const running = await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  assert(running.coreTicks > first.coreTicks,'guest time must advance');
+  // DOM -> SharedArrayBuffer -> native GameCube mapping and emulated Wii Remote.
+  // Focus after clicking transport buttons previously swallowed all keyboard input.
+  const nativeInput = () => page.evaluate(()=>window.__host.adapter.request('validationReadWebInput'));
+  assert.equal(await page.$eval('#nunchukConnected',el=>el.checked),false);
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiExtension===0,{timeout:10000});
+  await page.locator('#nunchukConnected').click();
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiExtension===1,{timeout:10000});
+  // Default mouse hover must reach the native Wii pointer without a click.
+  assert.equal(await page.$eval('#mouseMode',el=>el.value),'cstick');
+  const hoverScreen=await page.$('#screen');await hoverScreen.scrollIntoView();
+  let hoverBox=await hoverScreen.boundingBox();
+  const moveToHoverPoint = () => page.mouse.move(hoverBox.x+hoverBox.width*.75,hoverBox.y+hoverBox.height*.25);
+  await moveToHoverPoint();
+  const hoverDeadline=Date.now()+10000;
+  let hoverInput;
+  while (Date.now()<hoverDeadline) {
+    hoverInput=await nativeInput();
+    if (hoverInput.wiiA===0&&hoverInput.wiiB===0&&Math.abs(hoverInput.pointerX-.5)<.03&&Math.abs(hoverInput.pointerY-.5)<.03) break;
+    const currentBox=await hoverScreen.boundingBox();
+    // The boot layout can move the canvas after scrollIntoView (observed 12px).
+    // Reposition only on a geometry change; retain the same native assertion.
+    if (JSON.stringify(currentBox)!==JSON.stringify(hoverBox)) {
+      hoverBox=currentBox;
+      await moveToHoverPoint();
+    }
+    await new Promise(resolve=>setTimeout(resolve,50));
+  }
+  assert(hoverInput.wiiA===0&&hoverInput.wiiB===0&&Math.abs(hoverInput.pointerX-.5)<.03&&Math.abs(hoverInput.pointerY-.5)<.03, `native hover mapping: ${JSON.stringify(hoverInput)}`);
+  assert.equal(await page.$eval('#screen',el=>getComputedStyle(el).cursor),'crosshair');
+  await page.mouse.move(1,1);
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.pointerX===0&&s.pointerY===0;},{timeout:10000});
+  await page.focus('#saveButton');
+  await page.keyboard.down('x');
+  console.log('Pressed input diagnostic',await nativeInput());
+  await page.waitForFunction(async()=>{
+    const state=await window.__host.adapter.request('validationReadWebInput');
+    return state.available && (state.buttons & 0x100) && state.wiiA === 1;
+  },{timeout:10000});
+  const pressed=await nativeInput();
+  assert(pressed.generation>0,'native core must consume a published input generation');
+  await page.keyboard.up('x');
+  await page.waitForFunction(async()=>{
+    const state=await window.__host.adapter.request('validationReadWebInput');
+    return state.mask===0 && state.buttons===0 && state.wiiA===0;
+  },{timeout:10000});
+  // Pair through a server lobby and prove remote input reaches the native core.
+  assert.equal(await page.$eval('#lanLobbyActions', el => el.disabled), true);
+  assert.equal(await page.$eval('#lanSaveActions', el => el.disabled), true);
+  await page.$eval('#lanConnect', button => button.click());
+  await page.waitForFunction(() => !document.querySelector('#lanLobbyActions').disabled);
+  await page.$eval('#lanHost', button => button.click());
+  await page.waitForFunction(() => document.querySelector('#lanRoom').textContent.includes('Private invitation:'));
+  await page.evaluate(async () => {
+    const { createLanSession } = await import('./src/lan.js');
+    const { createPlayServer } = await import('./src/lan-server.js');
+    window.lanGuest = createLanSession();
+    window.guestServer = createPlayServer({ onDisconnect: () => window.lanGuest.close(), onUpdate: async update => {
+      for (const event of update.events) if (event.type === 'signal') {
+        const answer = await window.lanGuest.answer(JSON.stringify(event.description));
+        await window.guestServer.request('signal', { description: JSON.parse(answer) });
+      }
+    } });
+    await window.guestServer.connect(location.origin);
+    const code = document.querySelector('#lanRoom').textContent.split('Private invitation: ')[1];
+    await window.guestServer.request('join', { code });
+  });
+  await page.waitForFunction(() => window.lanGuest.connected);
+  await page.evaluate(() => window.lanGuest.controls(['A']));
+  await page.waitForFunction(async () => (await window.__host.adapter.request('validationReadWebInput')).wiiA === 1, {timeout:10000});
+  await page.$eval('#lanDisconnect', button => button.click());
+  await page.waitForFunction(async () => (await window.__host.adapter.request('validationReadWebInput')).wiiA === 0, {timeout:10000});
+  assert.equal(await page.$eval('#lanSaveActions', el => el.disabled), true);
+  await page.evaluate(() => window.guestServer.disconnect());
+  console.log('PASS: play-server lobby gating, native remote A consumption and disconnect release.');
+  // A quick tap must survive long enough for native input polling.
+  await page.keyboard.press('x');
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiA===1,{timeout:10000,polling:10});
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiA===0,{timeout:10000,polling:10});
+  await page.focus('#librarySearch');
+  await page.keyboard.type('x');
+  assert.equal((await nativeInput()).buttons,0,'typing in a search field must not press native A');
+  await page.$eval('#librarySearch',el=>el.blur());
+  await page.keyboard.down('w');
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).stickY===224,{timeout:10000});
+  await page.evaluate(()=>window.dispatchEvent(new Event('blur')));
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).stickY===128,{timeout:10000});
+  await page.keyboard.up('w');
+  await page.keyboard.down('q');
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.nunchukC===1&&s.wiiHome===0;},{timeout:10000});
+  await page.keyboard.up('q');await page.keyboard.down('h');
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.nunchukC===0&&s.wiiHome===1;},{timeout:10000});
+  await page.keyboard.up('h');
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiHome===0,{timeout:10000});
+  for (const [key, field] of [['e','nunchukZ'],['v','wiiOne'],['b','wiiTwo'],['c','wiiMinus'],['Enter','wiiPlus'],['Space','remoteShake'],['ShiftLeft','nunchukShake'],['Numpad4','tiltLeft']]) {
+    await page.keyboard.down(key);
+    await page.waitForFunction(async field=>(await window.__host.adapter.request('validationReadWebInput'))[field]===1,{timeout:10000},field);
+    await page.keyboard.up(key);
+    await page.waitForFunction(async field=>(await window.__host.adapter.request('validationReadWebInput'))[field]===0,{timeout:10000},field);
+  }
+  // Switch the real Dolphin attachment while the guest is running, and keep
+  // the disconnect bit through ordinary input release and focus changes.
+  assert.equal((await nativeInput()).wiiExtension, 1);
+  await page.locator('#nunchukConnected').click();
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiExtension===0,{timeout:10000});
+  await page.focus('#screen');
+  await page.keyboard.press('x');
+  await page.evaluate(()=>window.dispatchEvent(new Event('blur')));
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.wiiExtension===0 && s.mask===(1<<27);},{timeout:10000});
+  assert.equal(await page.evaluate(()=>localStorage.getItem('dolphin-nunchuk-connected')), 'false');
+  await page.locator('#nunchukConnected').click();
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.wiiExtension===1 && s.mask===0;},{timeout:10000});
+  // Real native state also covers touch, mouse axes and gamepad lifecycle.
+  await page.$eval('[data-touch-button="B"]',el=>el.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,pointerId:71,pointerType:'touch'})));
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiB===1,{timeout:10000});
+  await page.$eval('[data-touch-button="B"]',el=>el.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:71,pointerType:'touch'})));
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiB===0,{timeout:10000});
+  // Trusted multi-touch events must reach visible controls in fullscreen.
+  await page.select('#touchMode','on');
+  // Releasing one finger must leave the remaining stick owner visible and active.
+  await page.$eval('[data-touch-stick="main"]', el => {
+    const rect = el.getBoundingClientRect();
+    for (const [pointerId,x] of [[175,.8],[176,.2]]) el.dispatchEvent(new PointerEvent('pointerdown',{
+      bubbles:true,pointerType:'touch',pointerId,clientX:rect.x+rect.width*x,clientY:rect.y+rect.height/2
+    }));
+    el.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerType:'touch',pointerId:176}));
+  });
+  await page.waitForFunction(async()=>(await window.__host.adapter.request('validationReadWebInput')).stickX>160,{timeout:10000});
+  const stickVisual = await page.$eval('[data-touch-stick="main"]',el=>({
+    active:el.classList.contains('is-active'),offset:parseFloat(el.style.getPropertyValue('--stick-x')),
+    travel:(el.clientWidth-el.querySelector('.touch-stick-knob').offsetWidth)/2
+  }));
+  assert(stickVisual.active && stickVisual.offset>0 && stickVisual.offset<=stickVisual.travel,'stick knob must follow the remaining finger and stay inside its base');
+  await page.$eval('[data-touch-stick="main"]',el=>el.dispatchEvent(new PointerEvent('pointercancel',{bubbles:true,pointerType:'touch',pointerId:175})));
+  await page.waitForFunction(async()=>(await window.__host.adapter.request('validationReadWebInput')).stickX===128,{timeout:10000});
+  await page.setViewport({width:390,height:844});
+  await page.click('#fullscreenButton');
+  await page.waitForFunction(()=>document.fullscreenElement?.id==='dropZone');
+  const touchB=await (await page.$('[data-touch-button="B"]')).boundingBox();
+  const touchStick=await (await page.$('[data-touch-stick="main"]')).boundingBox();
+  const touchAim=await (await page.$('[data-touch-stick="pointer"]')).boundingBox();
+  const client=await page.createCDPSession();
+  // Fullscreen uses the displayed picture bounds, even after resizing.
+  const fullscreenScreen=await (await page.$('#screen')).boundingBox();
+  await page.mouse.move(fullscreenScreen.x+fullscreenScreen.width*.25,fullscreenScreen.y+fullscreenScreen.height*.75);
+  await page.waitForFunction(async()=>{
+    const s=await window.__host.adapter.request('validationReadWebInput');
+    return s.wiiA===0&&Math.abs(s.pointerX+.5)<.03&&Math.abs(s.pointerY+.5)<.03;
+  },{timeout:10000});
+  await client.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[
+    {id:1,x:touchB.x+touchB.width/2,y:touchB.y+touchB.height/2},
+    {id:2,x:touchStick.x+touchStick.width*.8,y:touchStick.y+touchStick.height/2},
+    {id:3,x:touchAim.x+touchAim.width*.8,y:touchAim.y+touchAim.height*.2}
+  ]});
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.wiiB===1&&s.stickX>160&&s.cStickX>160;},{timeout:10000});
+  const mobileKnobs = await page.evaluate(()=>[...document.querySelectorAll('[data-touch-stick]')].map(el=>({
+    base:el.getBoundingClientRect().toJSON(),knob:el.querySelector('.touch-stick-knob').getBoundingClientRect().toJSON()
+  })));
+  for (const {base,knob} of mobileKnobs) assert(knob.left>=base.left-1&&knob.top>=base.top-1&&knob.right<=base.right+1&&knob.bottom<=base.bottom+1,'mobile stick knobs must fit inside their bases while held');
+  await client.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.wiiB===0&&s.stickX===128;},{timeout:10000});
+  const fullscreenActions=await page.$$eval('.fullscreen-actions button',buttons=>buttons.map(button=>{
+    const box=button.getBoundingClientRect();
+    return {text:button.textContent,visible:box.width>0&&box.height>0&&box.right<=innerWidth&&box.bottom<=innerHeight};
+  }));
+  assert.deepEqual(fullscreenActions.map(action=>action.text),['💾 Save','↺ Load','✕ Exit']);
+  assert(fullscreenActions.every(action=>action.visible),'fullscreen save, load and exit must stay on screen');
+  await page.click('.fullscreen-exit');
+  await page.waitForFunction(()=>!document.fullscreenElement);
+  await page.setViewport({width:1280,height:900});
+  // The Save states widget writes and restores a chosen slot in the native core.
+  await page.waitForFunction(()=>document.querySelectorAll('#saveStatePanel .save-slot').length===4);
+  assert.equal(await page.$eval('#loadButton',el=>el.disabled),true,'an empty selected slot cannot be loaded');
+  await page.$eval('#saveStatePanel .save-slot:nth-child(2) button[aria-label="Save to slot 2"]',el=>el.click());
+  // Saving asks first; cancelling leaves the slot untouched.
+  await page.waitForSelector('dialog.save-confirm[open]');
+  await page.click('dialog.save-confirm [data-save-cancel]');
+  await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent==='Save cancelled.');
+  assert.match(await page.$eval('#saveStatePanel .save-slot:nth-child(2) .save-slot-meta',el=>el.textContent),/Empty/);
+  await page.$eval('#saveStatePanel .save-slot:nth-child(2) button[aria-label="Save to slot 2"]',el=>el.click());
+  await page.waitForSelector('dialog.save-confirm[open]');
+  await page.click('dialog.save-confirm [data-save-confirm]');
+  assert.equal(await page.$eval('#saveButton',el=>el.disabled),true,'other state controls must be disabled during capture');
+  await page.waitForFunction(()=>!/Empty|No game/.test(document.querySelector('#saveStatePanel .save-slot:nth-child(2) .save-slot-meta').textContent),{timeout:60000});
+  assert.equal(await page.$eval('#saveStatePanel .save-slot:nth-child(2) input',el=>el.checked),true,'saving selects the slot');
+  assert.equal(await page.$eval('#saveStatePanel .save-slot:nth-child(2) .save-slot-game',el=>el.textContent),await page.evaluate(()=>window.__host.game.name.replace(/\.(iso|gcm|rvz|wbfs|wad|dol|elf|ciso|gcz)$/i,'')),'saved slots show the game name');
+  await page.waitForFunction(()=>!document.querySelector('#saveStatePanel .save-slot:nth-child(2) button[aria-label="Load slot 2"]').disabled,{timeout:60000});
+  const beforeSlotLoad=await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  await page.$eval('#loadButton', button => button.click());
+  await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent==='Loaded slot 2.',{timeout:60000}).catch(async error => { console.log('Save-load diagnostic', await page.$eval('[data-save-status]', el => el.textContent)); throw error; });
+  const loadedSlot=await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  assert(loadedSlot.loadedCheckpointGeneration>beforeSlotLoad.loadedCheckpointGeneration,'Load must restore a native checkpoint');
+  assert(loadedSlot.loadedCheckpointTicks<=beforeSlotLoad.coreTicks,'Load must restore earlier guest execution');
+  const savedTicks=loadedSlot.loadedCheckpointTicks;
+  const storedSlotDigest=()=>page.evaluate(async()=>{
+    const { stateSlotKey }=await import('./src/save-states.js');
+    const host=window.__host;
+    const state=await host.stateSlots.store.get(stateSlotKey(host.game,host.adapter,1));
+    return [...new Uint8Array(await crypto.subtle.digest('SHA-256',state.bytes))];
+  });
+  const savedDigest=await storedSlotDigest();
+  // A fast screen tap must retain its aim together with A until native polling.
+  const screenTap = await page.$eval('#screen', async el => {
+    const rect = el.getBoundingClientRect();
+    for (const type of ['pointerdown', 'pointerup']) el.dispatchEvent(new PointerEvent(type, {
+      bubbles:true,pointerType:'touch',pointerId:173,clientX:rect.x+rect.width*.8,clientY:rect.y+rect.height*.2
+    }));
+    return window.__host.adapter.request('validationReadWebInput');
+  });
+  assert.equal(screenTap.wiiA,1,'screen tap must press native A');
+  assert(screenTap.cStickX>180 && screenTap.cStickY>180,'screen tap must preserve its aiming position while A is latched');
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.wiiA===0&&s.pointerX>.55&&s.pointerY>.55;},{timeout:10000});
+  // Mouse aiming must take ownership from a retained screen tap.
+  await page.select('#mouseMode','cstick');
+  const tappedScreen=await page.$('#screen');await tappedScreen.scrollIntoView();
+  const tappedBox=await tappedScreen.boundingBox();
+  await page.mouse.move(tappedBox.x+tappedBox.width*.25,tappedBox.y+tappedBox.height*.75);
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.pointerX<-.45&&s.pointerY<-.45;},{timeout:10000});
+  await page.select('#mouseMode','off');
+  // Focus loss releases both retained taps and absolute touch aim.
+  await page.evaluate(()=>window.dispatchEvent(new Event('blur')));
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.pointerX===0&&s.pointerY===0;},{timeout:10000});
+  // Sliding from a held B to A starts a new press window for A.
+  await (await page.$('[data-touch-button="A"]')).scrollIntoView();
+  await page.$eval('[data-touch-button="B"]',el=>el.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,pointerType:'touch',pointerId:174})));
+  await page.waitForFunction(async()=>(await window.__host.adapter.request('validationReadWebInput')).wiiB===1,{timeout:10000});
+  await new Promise(resolve=>setTimeout(resolve,1100));
+  const slideTap = await page.evaluate(async()=> {
+    const from = document.querySelector('[data-touch-button="B"]');
+    const target = document.querySelector('[data-touch-button="A"]').getBoundingClientRect();
+    for (const type of ['pointermove','pointerup']) from.dispatchEvent(new PointerEvent(type,{
+      bubbles:true,pointerType:'touch',pointerId:174,clientX:target.x+target.width/2,clientY:target.y+target.height/2
+    }));
+    return window.__host.adapter.request('validationReadWebInput');
+  });
+  assert.equal(slideTap.wiiA,1,'a brief slide onto A must survive native polling');
+  assert.equal(slideTap.wiiB,0,'sliding off held B must release it');
+  await page.waitForFunction(async()=>(await window.__host.adapter.request('validationReadWebInput')).mask===0,{timeout:10000});
+  await page.select('#mouseMode','cstick');
+  const screen=await page.$('#screen');await screen.scrollIntoView();const box=await screen.boundingBox();
+  await page.mouse.move(box.x+box.width*0.75,box.y+box.height*0.25);
+  await page.waitForFunction(async()=>{
+    const state=await window.__host.adapter.request('validationReadWebInput');
+    return state.wiiA===0&&Math.abs(state.pointerX-.5)<.03&&Math.abs(state.pointerY-.5)<.03;
+  },{timeout:10000});
+  await page.mouse.down();
+  await page.waitForFunction(async()=>{
+    const state=await window.__host.adapter.request('validationReadWebInput');return state.wiiA===1&&state.cStickX>160&&state.cStickY>160;
+  },{timeout:10000});
+  await page.mouse.up();
+  await page.waitForFunction(async()=>{
+    const state=await window.__host.adapter.request('validationReadWebInput');return state.wiiA===0&&Math.abs(state.pointerX-.5)<.03&&Math.abs(state.pointerY-.5)<.03;
+  },{timeout:10000});
+  // Hover reaches all four corners without a circular gate or recenter on click.
+  for (const [x,y] of [[.05,.05],[.95,.05],[.05,.95],[.95,.95]]) {
+    await page.mouse.move(box.x+box.width*x,box.y+box.height*y);
+    await page.waitForFunction(async({x,y})=>{
+      const s=await window.__host.adapter.request('validationReadWebInput');
+      return Math.abs(s.pointerX-(x*2-1))<.04&&Math.abs(s.pointerY-(1-y*2))<.04;
+    },{timeout:10000},{x,y});
+  }
+  // Mouse motion must reach native Wii groups and release cleanly.
+  const motionBounds = await (await page.$('#screen')).boundingBox();
+  await page.mouse.move(motionBounds.x+motionBounds.width/2,motionBounds.y+motionBounds.height/2);
+  await page.mouse.down({button:'middle'});
+  await page.waitForFunction(async()=>(await window.__host.adapter.request('validationReadWebInput')).remoteShake===1,{timeout:10000});
+  await page.mouse.up({button:'middle'});
+  await page.waitForFunction(async()=>(await window.__host.adapter.request('validationReadWebInput')).remoteShake===0,{timeout:10000});
+  await page.select('#mouseMode','tilt');
+  await page.mouse.down();
+  await page.mouse.move(motionBounds.x+motionBounds.width*.1,motionBounds.y+motionBounds.height/2);
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.tiltLeft===1&&s.wiiA===0;},{timeout:10000});
+  await page.mouse.up();
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.tiltLeft===0&&s.wiiA===0;},{timeout:10000});
+  // Real Back/Forward mouse events must shake without navigating away.
+  await page.select('#mouseMode','cstick');
+  const sideSession=await page.target().createCDPSession();
+  await page.evaluate(()=>{history.pushState({},'', '#motion-before');history.pushState({},'', '#motion-after');history.back();});
+  await page.waitForFunction(()=>location.hash==='#motion-before',{timeout:10000});
+  const sideEvent=async(type,button,buttons)=>sideSession.send('Input.dispatchMouseEvent',{type,button,buttons,clickCount:1,x:motionBounds.x+motionBounds.width/2,y:motionBounds.y+motionBounds.height/2});
+  for(const [button,buttons,field]of[['forward',16,'nunchukShake'],['back',8,'remoteShake']]){
+    await sideEvent('mousePressed',button,buttons);
+    await page.waitForFunction(async field=>(await window.__host.adapter.request('validationReadWebInput'))[field]===1,{timeout:10000},field);
+    await sideEvent('mouseReleased',button,0);
+    await page.waitForFunction(async field=>(await window.__host.adapter.request('validationReadWebInput'))[field]===0,{timeout:10000},field);
+    await new Promise(resolve=>setTimeout(resolve,200));
+    assert.equal(await page.evaluate(()=>location.hash),'#motion-before','motion side button must not navigate history');
+  }
+  await page.select('#mouseMode','off');
+  await sideEvent('mousePressed','forward',16);await sideEvent('mouseReleased','forward',0);
+  await page.waitForFunction(()=>location.hash==='#motion-after',{timeout:10000});
+  await page.evaluate(url=>history.replaceState({},'',url),testUrl.href);
+  await page.select('#mouseMode','off');
+  await page.evaluate(()=>{
+    window.__nativeTestPads=[{index:0,id:'Native E2E controller',mapping:'standard',connected:true,axes:[0.6,0,0.6,0],buttons:Array.from({length:17},(_,i)=>({pressed:i===0,value:i===0?1:0}))}];
+    Object.defineProperty(navigator,'getGamepads',{configurable:true,value:()=>window.__nativeTestPads});
+    window.dispatchEvent(new Event('gamepadconnected'));
+  });
+  await page.waitForFunction(async()=>{
+    const state=await window.__host.adapter.request('validationReadWebInput');
+    return state.wiiA===1&&state.nunchukStickX>.3&&state.nunchukStickX<.7&&state.pointerX>.3&&state.pointerX<.7;
+  },{timeout:10000});
+  // Standard stick clicks provide simulated motion without sensor hardware.
+  await page.evaluate(()=>{const p=window.__nativeTestPads[0];p.axes=[0,0,0,0];p.buttons=p.buttons.map((_,i)=>({pressed:i===10,value:i===10?1:0}));});
+  await page.waitForFunction(async()=>(await window.__host.adapter.request('validationReadWebInput')).remoteShake===1,{timeout:10000});
+  await page.evaluate(()=>{const p=window.__nativeTestPads[0];p.buttons=p.buttons.map((_,i)=>({pressed:i===11,value:i===11?1:0}));});
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.remoteShake===0&&s.nunchukShake===1;},{timeout:10000});
+  await page.select('#controllerMotionMode','tilt');
+  await page.evaluate(()=>{const p=window.__nativeTestPads[0];p.buttons=p.buttons.map(()=>({pressed:false,value:0}));p.axes=[0,0,-.8,0];});
+  await page.waitForFunction(async()=>{const s=await window.__host.adapter.request('validationReadWebInput');return s.tiltLeft===1&&s.nunchukShake===0&&s.pointerX===0;},{timeout:10000});
+  await page.evaluate(()=>{window.__nativeTestPads[0].axes=[0,0,0,0];});
+  await page.waitForFunction(async()=>(await window.__host.adapter.request('validationReadWebInput')).tiltLeft===0,{timeout:10000});
+  await page.select('#controllerMotionMode','pointer');
+  await page.evaluate(()=>{const p=window.__nativeTestPads[0];p.axes=[.6,0,.6,0];p.buttons[0]={pressed:true,value:1};});
+  await page.select('#controllerSelect','off');
+  await page.waitForFunction(async()=>{
+    const state=await window.__host.adapter.request('validationReadWebInput');return state.wiiA===0&&state.stickX===128;
+  },{timeout:10000});
+  await page.select('#controllerSelect','auto');
+  await page.waitForFunction(async()=> (await window.__host.adapter.request('validationReadWebInput')).wiiA===1,{timeout:10000});
+  await page.evaluate(()=>{window.__nativeTestPads=[];window.dispatchEvent(new Event('gamepaddisconnected'));});
+  await page.waitForFunction(async()=>{
+    const state=await window.__host.adapter.request('validationReadWebInput');return state.mask===0&&state.wiiA===0&&state.stickX===128;
+  },{timeout:10000});
+  const pause = await page.evaluate(()=>window.__host.adapter.request('validationSetCorePaused',{paused:true}));
+  assert.equal(pause.paused,true);
+  const paused1=await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  await new Promise(resolve=>setTimeout(resolve,200));
+  const paused2=await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  assert.equal(paused1.coreTicks,paused2.coreTicks,'pausing must stop guest execution');
+  const resume=await page.evaluate(()=>window.__host.adapter.request('validationSetCorePaused',{paused:false}));
+  assert.equal(resume.paused,false);
+  await page.waitForFunction(async ticks=>(await window.__host.adapter.request('validationReadCoreProgress')).coreTicks>ticks,{timeout:10000},paused2.coreTicks);
+
+  // Slot metadata and selection survive a new document; loading restores the
+  // same native checkpoint after booting the cached game again.
+  await page.goto(testUrl.href);
+  await page.waitForFunction(()=>document.querySelector('.library-section')?.dataset.catalogLoaded === 'true' && document.querySelector('#libraryReadyList button')?.disabled === false,{timeout:60000});
+  assert.equal(await page.$eval('#saveButton',el=>el.disabled),true,'saving requires a mounted game');
+  await page.locator('#libraryReadyList button').click(); // Re-queries if the list re-renders.
+  await page.waitForFunction(()=>window.__host?.game?.coreBoot?.accepted && !document.querySelector('#loadButton').disabled,{timeout:60000}).catch(async error=>{
+    console.log('Reopened boot state',await page.evaluate(async()=>({
+      mode:window.__host?.mode,game:window.__host?.game,
+      slots:await window.__host?.listStateSlots?.().catch(e=>String(e)),
+      selected:document.querySelector('#saveStatePanel input:checked')?.value,
+      loadDisabled:document.querySelector('#loadButton')?.disabled,
+      saveStatus:document.querySelector('[data-save-status]')?.textContent,
+      status:document.querySelector('#hudStatus')?.textContent,adapterStatus:document.querySelector('#adapterStatus')?.textContent
+    })));
+    throw error;
+  });
+  assert.equal(await page.$eval('#saveStatePanel .save-slot:nth-child(2) input',el=>el.checked),true);
+  await page.$eval('#loadButton', button => button.click());
+  await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent==='Loaded slot 2.',{timeout:60000});
+  const persistedSlot=await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  assert.deepEqual(await storedSlotDigest(),savedDigest,'reopening must preserve the exact saved bytes');
+  assert(persistedSlot.loadedCheckpointGeneration>0,'reopening must restore a native checkpoint');
+  // Native host jobs can advance ticks while the load settles. The restored
+  // checkpoint must stay within one guest frame of the earlier load.
+  assert(Math.abs(persistedSlot.loadedCheckpointTicks-savedTicks)<persistedSlot.coreTicksPerSecond/60,'reopening must restore the persisted guest timeline');
+
+  // Invalid files report a visible failure and release the operation guard.
+  await (await page.$('#ulStateInput')).uploadFile(invalidState);
+  await page.waitForFunction(()=>document.querySelector('[data-save-status]').classList.contains('error') && !document.querySelector('#saveButton').disabled,{timeout:60000});
+  assert.match(await page.$eval('[data-save-status]',el=>el.textContent),/truncated save-state header/);
+
+  // Download a real state, then restore its bytes through the upload control.
+  const downloadClient=await page.createCDPSession();
+  await downloadClient.send('Browser.setDownloadBehavior',{behavior:'allow',downloadPath:temp});
+  await page.click('[data-save-download]');
+  await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent.startsWith('Downloaded ') && !document.querySelector('#saveButton').disabled,{timeout:60000});
+  const downloadName=await page.$eval('[data-save-status]',el=>el.textContent.slice('Downloaded '.length,-1));
+  assert.match(downloadName,/^Dolphin browser CPU test-\d{4}-\d{2}-\d{2}T.*\.sav$/,'backup names identify the game and capture time');
+  for (let attempt=0;attempt<100;attempt++) {
+    if ((await readdir(temp)).includes(downloadName)) break;
+    await new Promise(done=>setTimeout(done,100));
+  }
+  const backup=await readFile(join(temp,downloadName));
+  assert(backup.byteLength>32,'backup must contain a native state payload');
+  const beforeUpload=await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  await (await page.$('#ulStateInput')).uploadFile(join(temp,downloadName));
+  await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent.startsWith('Loaded ') && document.querySelector('[data-save-status]').textContent.includes('.sav'),{timeout:60000});
+  const afterUpload=await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  assert(afterUpload.loadedCheckpointGeneration>beforeUpload.loadedCheckpointGeneration,'uploaded bytes must restore a native checkpoint');
+
+  // Muting persists when reopening a game; a full preference reset keeps both
+  // the cached disc and the exact saved bytes, which still restore natively.
+  await page.click('#muteButton');
+  assert.equal(await page.evaluate(()=>window.__audio.muted),true);
+  await page.goto(testUrl.href);
+  await page.waitForFunction(()=>window.DolphinLayout && document.querySelector('#libraryReadyList button')?.disabled===false,{timeout:60000});
+  await page.locator('#libraryReadyList button').click(); // Re-queries if the list re-renders.
+  await page.waitForFunction(()=>window.__host?.game?.coreBoot?.accepted,{timeout:60000});
+  assert.equal(await page.evaluate(()=>window.__audio.muted),true,'saved mute must survive booting a game');
+  await page.click('#btn-layout-menu');
+  await Promise.all([page.waitForNavigation(),page.click('#resetAllButton')]);
+  await page.waitForFunction(()=>window.DolphinLayout && document.querySelector('#libraryReadyList button')?.disabled===false,{timeout:60000});
+  await page.locator('#libraryReadyList button').click(); // Re-queries if the list re-renders.
+  await page.waitForFunction(()=>window.__host?.game?.coreBoot?.accepted && !document.querySelector('#saveStatePanel .save-slot:nth-child(2) button[aria-label="Load slot 2"]').disabled,{timeout:60000});
+  assert.deepEqual(await storedSlotDigest(),savedDigest,'reset must keep native save-state bytes');
+  assert.equal(await page.evaluate(()=>window.__audio.muted),false,'reset restores automatic audio on game boot');
+  await page.$eval('#saveStatePanel .save-slot:nth-child(2) input',control=>control.click());
+  await page.$eval('#loadButton', button => button.click());
+  await page.waitForFunction(()=>document.querySelector('[data-save-status]').textContent==='Loaded slot 2.',{timeout:60000});
+  const resetLoaded=await page.evaluate(()=>window.__host.adapter.request('validationReadCoreProgress'));
+  assert(resetLoaded.loadedCheckpointGeneration>0,'save states must still load after resetting all preferences');
+  assert.deepEqual(errors,[]);
+  console.log('PASS: real Dolphin executes homebrew, consumes native keyboard/touch/mouse/gamepad input, saves and restores persistent slots across reopening, and downloads/uploads native state files. No graphics/gameplay benchmark.');
+} finally {
+  await browser?.close(); await new Promise(done=>server.close(done)); await rm(temp,{recursive:true,force:true});
+}
